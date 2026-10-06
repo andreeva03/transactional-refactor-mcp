@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   createProtocolConnection, StreamMessageReader, StreamMessageWriter,
   type InitializeResult, type ProtocolConnection, type PublishDiagnosticsParams
-} from "vscode-languageserver-protocol/node.js";
+} from "vscode-languageserver-protocol/node";
 import { DiagnosticSeverity, type Diagnostic, type TextDocumentItem } from "vscode-languageserver-types";
 import { z } from "zod";
 
@@ -49,6 +49,12 @@ const severity = {
   error: DiagnosticSeverity.Error, warning: DiagnosticSeverity.Warning,
   suggestion: DiagnosticSeverity.Hint, message: DiagnosticSeverity.Information
 } as const;
+/** Normalize URI encoding and Windows casing without reading source files. */
+function canonicalUri(uri: string): string {
+  let path = resolve(fileURLToPath(uri));
+  if (process.platform === "win32") path = path.toLowerCase();
+  return pathToFileURL(path).href;
+}
 function asError(error: unknown): Error { return error instanceof Error ? error : new Error(String(error)); }
 function validateTimeout(ms: number): void {
   if (!Number.isInteger(ms) || ms <= 0 || ms > 2_147_483_647) throw new RangeError("Invalid timeout.");
@@ -102,6 +108,7 @@ export class LspSupervisor {
     return this.serialized(async () => { await this.stopInternal(); this.documents.clear(); });
   }
   openVirtualDocument(uri: string, languageId: string, version: number, text: string): Promise<void> {
+    uri = canonicalUri(uri);
     return this.serialized(async () => {
       this.validateDocument(uri, version);
       const session = this.ready();
@@ -124,6 +131,7 @@ export class LspSupervisor {
     });
   }
   updateVirtualDocument(uri: string, version: number, text: string): Promise<void> {
+    uri = canonicalUri(uri);
     return this.serialized(async () => {
       this.validateDocument(uri, version);
       const session = this.ready();
@@ -146,6 +154,7 @@ export class LspSupervisor {
     });
   }
   closeVirtualDocument(uri: string): Promise<void> {
+    uri = canonicalUri(uri);
     return this.serialized(async () => {
       const session = this.ready();
       if (!this.documents.has(uri)) throw new Error(`Document not open: ${uri}`);
@@ -156,8 +165,9 @@ export class LspSupervisor {
       catch (error) { this.fail(session, asError(error)); throw error; }
     });
   }
-  getDiagnostics(uri: string): Diagnostic[] { return structuredClone(this.diagnostics.get(uri) ?? []); }
+  getDiagnostics(uri: string): Diagnostic[] { return structuredClone(this.diagnostics.get(canonicalUri(uri)) ?? []); }
   async waitForDiagnostics(uri: string, expectedVersion: number, timeoutMs = 2_000): Promise<Diagnostic[]> {
+    uri = canonicalUri(uri);
     validateTimeout(timeoutMs);
     await this.operations;
     this.ready();
@@ -175,6 +185,7 @@ export class LspSupervisor {
     });
   }
   collectCompleteDiagnostics(uri: string, expectedVersion: number, timeoutMs = 15_000): Promise<Diagnostic[]> {
+    uri = canonicalUri(uri);
     return this.serialized(async () => {
       validateTimeout(timeoutMs);
       const session = this.ready();
@@ -281,6 +292,8 @@ export class LspSupervisor {
       this.fail(session, new Error("Malformed publishDiagnostics payload."));
       return;
     }
+    try { params = { ...params, uri: canonicalUri(params.uri) }; }
+    catch (error) { this.fail(session, asError(error)); return; }
     const document = this.documents.get(params.uri);
     const version = session.versions.get(params.uri);
     if (!document || version === undefined || version !== document.version) return;

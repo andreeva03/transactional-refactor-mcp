@@ -62,7 +62,7 @@ export class VerificationPipeline {
         result.resolvedErrorsCount += delta.resolvedErrors.length;
         for (const diagnostic of delta.newErrors) result.newErrors.push({
           file: document.filePath, line: diagnostic.range.start.line + 1,
-          message: diagnostic.message, code: diagnostic.code ?? ""
+          message: typeof diagnostic.message === "string" ? diagnostic.message : diagnostic.message.value, code: diagnostic.code ?? ""
         });
       }
       result.canCommit = result.newErrors.length === 0;

@@ -6,7 +6,7 @@ export interface DiagnosticDelta {
   unchanged: Diagnostic[];
 }
 export function diagnosticSignature(diagnostic: Diagnostic): string {
-  return JSON.stringify([diagnostic.range.start.line, diagnostic.range.start.character, diagnostic.code ?? null, diagnostic.message]);
+  return JSON.stringify([diagnostic.range.start.line, diagnostic.range.start.character, diagnostic.code ?? null, typeof diagnostic.message === "string" ? diagnostic.message : diagnostic.message.value]);
 }
 function indexErrors(diagnostics: readonly Diagnostic[]): Map<string, Diagnostic> {
   return new Map(diagnostics.filter(d => d.severity === DiagnosticSeverity.Error).map(d => [diagnosticSignature(d), d]));
