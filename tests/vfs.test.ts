@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { spawnSync } from "node:child_process";
 import { CommitError, ConflictError, TransactionError, TransactionManager } from "../src/vfs/transaction-manager.js";
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "shadow-vfs-"));
@@ -115,4 +116,140 @@ test("missing baselines reject without poisoning the queue", async t => {
   await f.manager.rollback(tx);
   await f.manager.forget(tx);
   assert.throws(() => f.manager.getState(tx), TransactionError);
+});
+
+test("exact replacements reject stale and ambiguous edits and preserve literal replacement text", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const tx = f.manager.begin();
+  assert.equal(await f.manager.stageReplace(tx, "first.ts", "1", "2", 0), 1);
+  await assert.rejects(f.manager.stageReplace(tx, "first.ts", "2", "3", 0), /Version conflict/);
+  await f.manager.stageEdit(tx, "first.ts", "same same", 1);
+  await assert.rejects(f.manager.stageReplace(tx, "first.ts", "same", "x", 2), /exactly once/);
+  await assert.rejects(f.manager.stageReplace(tx, "first.ts", "missing", "x", 2), /exactly once/);
+  await f.manager.stageReplace(tx, "first.ts", "same same", "$&", 2);
+  assert.equal(await f.manager.readFile(tx, "first.ts"), "$&");
+  assert.equal(await readFile(f.first, "utf8"), "export const first = 1;\n");
+});
+
+test("create, rename and delete are virtual until commit", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const tx = f.manager.begin();
+  await f.manager.stageCreate(tx, "nested/created.ts", "export const created = 3;\n");
+  await f.manager.stageRename(tx, "first.ts", "nested/moved.ts", 0);
+  await f.manager.stageDelete(tx, "second.ts", 0);
+  await assert.rejects(readFile(join(f.root, "nested/created.ts")), { code: "ENOENT" });
+  assert.equal(await readFile(f.first, "utf8"), "export const first = 1;\n");
+  await assert.rejects(f.manager.readFile(tx, "first.ts"), /deletion/);
+  assert.equal(await f.manager.readFile(tx, "nested/moved.ts"), "export const first = 1;\n");
+  await f.manager.commit(tx);
+  assert.equal(await readFile(join(f.root, "nested/created.ts"), "utf8"), "export const created = 3;\n");
+  assert.equal(await readFile(join(f.root, "nested/moved.ts"), "utf8"), "export const first = 1;\n");
+  await assert.rejects(readFile(f.first), { code: "ENOENT" });
+  await assert.rejects(readFile(f.second), { code: "ENOENT" });
+});
+
+test("creation collisions and invalid rename leave staging unchanged", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const tx = f.manager.begin();
+  await assert.rejects(f.manager.stageCreate(tx, "first.ts", "x"), /exists/);
+  await assert.rejects(f.manager.stageRename(tx, "first.ts", "second.ts", 0), /exists/);
+  await assert.rejects(f.manager.stageCreate(tx, "../escape.ts", "x"), /workspace/);
+  await assert.rejects(f.manager.stageCreate(tx, ".transactional-refactor/bad.ts", "x"), /workspace/);
+  assert.equal(f.manager.status(tx).files.length, 0);
+  await f.manager.stageCreate(tx, "created.ts", "staged");
+  await writeFile(join(f.root, "created.ts"), "external");
+  await assert.rejects(f.manager.commit(tx), CommitError);
+  assert.equal(await readFile(join(f.root, "created.ts"), "utf8"), "external");
+});
+
+test("persistent staging resumes after restart and requires fresh verification", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const journal = join(f.root, ".transactional-refactor");
+  const first = new TransactionManager(f.root, undefined, journal);
+  const tx = first.begin();
+  await first.stageEdit(tx, "first.ts", "staged");
+  await first.stageCreate(tx, "new.ts", "new");
+  await first.completeVerification(await first.snapshotForVerification(tx), true);
+  const restarted = new TransactionManager(f.root, undefined, journal);
+  assert.equal(restarted.getState(tx), "ACTIVE");
+  assert.equal(await restarted.readFile(tx, "first.ts"), "staged");
+  assert.equal(await restarted.readFile(tx, "new.ts"), "new");
+  await restarted.rollback(tx);
+  await restarted.forget(tx);
+  assert.deepEqual(new TransactionManager(f.root, undefined, journal).list(), []);
+});
+
+test("a process crash mid-commit is recoverable without overwriting external edits", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const moduleUrl = new URL("../src/vfs/transaction-manager.js", import.meta.url).href;
+  const script = `
+    import { TransactionManager } from ${JSON.stringify(moduleUrl)};
+    import { rename } from 'node:fs/promises';
+    import { join } from 'node:path';
+    const root = process.argv[1];
+    const manager = new TransactionManager(root, async (from, to) => {
+      await rename(from, to);
+      process.exit(73);
+    }, join(root, '.transactional-refactor'));
+    const tx = manager.begin();
+    await manager.stageEdit(tx, 'first.ts', 'changed');
+    await manager.stageDelete(tx, 'second.ts', 0);
+    await manager.commit(tx);
+  `;
+  const crashed = spawnSync(process.execPath, ["--input-type=module", "-e", script, f.root], { encoding: "utf8", timeout: 15_000 });
+  assert.equal(crashed.status, 73, crashed.stderr);
+  const restarted = new TransactionManager(f.root, undefined, join(f.root, ".transactional-refactor"));
+  const tx = restarted.list()[0]!.txId;
+  assert.equal(restarted.getState(tx), "RECOVERY_REQUIRED");
+  await assert.rejects(restarted.rollback(tx), /RECOVERY_REQUIRED/);
+  await writeFile(f.first, "external");
+  await assert.rejects(restarted.recover(tx), ConflictError);
+  assert.equal(await readFile(f.first, "utf8"), "external");
+  await writeFile(f.first, "changed");
+  await restarted.recover(tx);
+  assert.equal(await readFile(f.first, "utf8"), "export const first = 1;\n");
+  assert.equal(await readFile(f.second, "utf8"), "export const second = 2;\n");
+  assert.equal(restarted.getState(tx), "ACTIVE");
+  await restarted.commit(tx);
+  assert.equal(await readFile(f.first, "utf8"), "changed");
+  await assert.rejects(readFile(f.second), { code: "ENOENT" });
+});
+
+test("failed installation restores deletions and removes installed creations", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  let calls = 0;
+  const manager = new TransactionManager(f.root, async (from, to) => {
+    if (++calls === 2) throw new Error("Injected failure after create and delete");
+    await rename(from, to);
+  });
+  const tx = manager.begin();
+  await manager.stageCreate(tx, "new.ts", "created");
+  await manager.stageDelete(tx, "first.ts", 0);
+  await manager.stageEdit(tx, "second.ts", "changed");
+  await assert.rejects(manager.commit(tx), CommitError);
+  await assert.rejects(readFile(join(f.root, "new.ts")), { code: "ENOENT" });
+  assert.equal(await readFile(f.first, "utf8"), "export const first = 1;\n");
+  assert.equal(await readFile(f.second, "utf8"), "export const second = 2;\n");
+  assert.equal(manager.getState(tx), "ACTIVE");
+});
+
+test("interrupted create and delete recover after restart", async t => {
+  const f = await fixture(); t.after(f.cleanup);
+  const journal = join(f.root, ".transactional-refactor");
+  let calls = 0;
+  const manager = new TransactionManager(f.root, async (from, to) => {
+    if (++calls >= 2) throw new Error("Injected installation and restoration failure");
+    await rename(from, to);
+  }, journal);
+  const tx = manager.begin();
+  await manager.stageDelete(tx, "first.ts", 0);
+  await manager.stageCreate(tx, "new.ts", "new");
+  await manager.stageEdit(tx, "second.ts", "changed");
+  await assert.rejects(manager.commit(tx), CommitError);
+  assert.equal(manager.getState(tx), "RECOVERY_REQUIRED");
+  const restarted = new TransactionManager(f.root, undefined, journal);
+  await restarted.recover(tx);
+  assert.equal(await readFile(f.first, "utf8"), "export const first = 1;\n");
+  assert.equal(await readFile(f.second, "utf8"), "export const second = 2;\n");
+  await assert.rejects(readFile(join(f.root, "new.ts")), { code: "ENOENT" });
 });

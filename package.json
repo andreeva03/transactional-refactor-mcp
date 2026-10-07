@@ -1,9 +1,9 @@
 {
   "name": "transactional-refactor-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Experimental transactional TypeScript refactoring over MCP with a shadow VFS and LSP diagnostic verification.",
+  "description": "Transactional TypeScript refactoring over MCP with project verification, virtual file operations, and restart recovery.",
   "engines": {
     "node": ">=20"
   },
