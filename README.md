@@ -106,9 +106,20 @@ sharing persistent journals.
 
 The MCP server saves transaction records under `.transactional-refactor/` in the
 workspace. Keep this directory out of version control: it contains full original
-and staged file contents. Staging writes this metadata but does not change source
-files. The lower-level `TransactionManager` enables journals with its third
-constructor argument; the MCP server enables them by default.
+and staged file contents. Each record has a format version and SHA-256 checksum.
+Older unversioned records are upgraded on load. A record with invalid data or a
+checksum mismatch is preserved, reported in `tx_list.journalIssues`, and skipped
+so other transactions remain available. Repair or archive the reported record
+only after inspecting it and confirming its transaction is no longer needed.
+
+At startup, the server removes uniquely named interrupted journal-write files
+and abandoned `.shadow-vfs-<transaction-id>-...` preparation directories that are
+not referenced by a valid recovery journal. If any journal is damaged, orphaned
+commit directories are left alone because their recovery purpose cannot be
+confirmed. Referenced recovery backups are never removed by this cleanup.
+Staging writes journal metadata but does not change source files. The lower-level
+`TransactionManager` enables journals with its third constructor argument; the
+MCP server enables them by default.
 
 After restarting, call `tx_list`, then `tx_status` and `tx_diff`. Active work can
 be resumed with its original ID. Previously verified work returns to `ACTIVE`

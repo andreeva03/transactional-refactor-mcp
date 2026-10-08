@@ -46,7 +46,7 @@ const descriptions: Record<ToolName, string> = {
   tx_stage_rename: "Stage a file move to an absent, unstaged destination. Requires source expectedVersion. Does not rewrite imports; stage those edits separately.",
   tx_status: "Inspect transaction state, file operations, versions and recovery directories. Does not change verification state.",
   tx_diff: "Inspect unified diffs between original and staged contents, including creations and deletions.",
-  tx_list: "List persisted transactions, including work restored after restart and interrupted commits requiring recovery.",
+  tx_list: "List persisted transactions, including restored work, interrupted commits, and any damaged journal records left untouched for inspection.",
   tx_recover: "Restore baseline source files after an interrupted commit, only when disk content matches baseline or staged content. Returns the transaction to ACTIVE for review and retry. Writes source files.",
   tx_verify: "Compare baseline and staged project-wide TypeScript diagnostics, including unstaged dependents and configuration errors. Returns VALID or BLOCKED, newErrors, resolvedErrorsCount, and canCommit. Unchanged existing errors do not block.",
   tx_commit: "Reverify, then save only a VERIFIED transaction. BLOCKED or failed verification writes no source files. Success expires txId. Inspect recovery information on failure.",
@@ -163,7 +163,7 @@ async function runServer(root: string, lock: { release(): Promise<void> }): Prom
         }
         case "tx_list": {
           schemas.tx_list.parse(args);
-          return result({ transactions: transactions.list() });
+          return result({ transactions: transactions.list(), journalIssues: transactions.journalIssues() });
         }
         case "tx_status": {
           const input = schemas.tx_status.parse(args);

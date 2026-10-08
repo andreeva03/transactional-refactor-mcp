@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, unlink } from "node:fs/promises";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 import { z } from "zod";
@@ -22,11 +22,24 @@ export interface VerificationSnapshot {
   readonly files: ReadonlyArray<{ readonly filePath: string; readonly buffer: FileBuffer }>;
 }
 export interface CleanupIssue { readonly directory: string; readonly cause: unknown }
+export interface JournalIssue { readonly txId: string; readonly path: string; readonly message: string }
 export interface CommitResult {
   readonly state: "COMMITTED";
   readonly filesWritten: number;
   readonly cleanupIssues: readonly CleanupIssue[];
 }
+const transactionStateSchema = z.enum(["ACTIVE", "VERIFIED", "COMMITTED", "ABORTED", "RECOVERY_REQUIRED"]);
+const journalFileSchema = z.object({
+  filePath: z.string(),
+  buffer: z.object({ baselineContent: z.string().nullable(), currentContent: z.string().nullable(), version: z.number().int().positive(), mode: z.number().int().optional() }).strict()
+}).strict();
+const journalPayloadSchema = z.object({
+  version: z.literal(1), state: transactionStateSchema, files: z.array(journalFileSchema), recoveryDirectories: z.array(z.string()).optional()
+}).strict();
+const legacyJournalSchema = z.object({
+  state: transactionStateSchema, files: z.array(journalFileSchema), recoveryDirectories: z.array(z.string()).optional()
+}).strict().transform(data => ({ ...data, version: 1 as const }));
+const journalEnvelopeSchema = z.object({ formatVersion: z.number().int(), checksum: z.string().regex(/^[0-9a-f]{64}$/), payload: z.string() }).strict();
 interface PreparedFile {
   target: string;
   replacement: string;
@@ -71,6 +84,7 @@ export class TransactionManager {
   private readonly baseDirectory: string;
   private readonly requestedDirectory: string;
   private readonly pathIdentities = new Map<string, string>();
+  private readonly journalProblems: JournalIssue[] = [];
 
   constructor(baseDirectory = process.cwd(), private readonly replaceFile: typeof rename = rename, private readonly journalDirectory?: string) {
     this.requestedDirectory = resolve(baseDirectory);
@@ -80,18 +94,31 @@ export class TransactionManager {
       this.journalDirectory = journalDirectory = join(this.baseDirectory, ".transactional-refactor");
       mkdirSync(journalDirectory, { recursive: true, mode: 0o700 });
       if (lstatSync(journalDirectory).isSymbolicLink()) throw new Error("Journal directory cannot be a symlink.");
-      const schema = z.object({ state: z.enum(["ACTIVE", "VERIFIED", "COMMITTED", "ABORTED", "RECOVERY_REQUIRED"]), files: z.array(z.object({ filePath: z.string(), buffer: z.object({ baselineContent: z.string().nullable(), currentContent: z.string().nullable(), version: z.number().int().positive(), mode: z.number().int().optional() }) })), recoveryDirectories: z.array(z.string()).optional() });
-      for (const name of readdirSync(journalDirectory).filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
-        const txId = z.string().uuid().parse(name.slice(0, -5));
-        const data = schema.parse(JSON.parse(readFileSync(join(journalDirectory, name), "utf8")));
-        const tx: Transaction = { state: data.state === "VERIFIED" ? "ACTIVE" : data.state, buffers: new Map(data.files.map(file => [this.resolvePath(file.filePath), file.buffer as FileBuffer])) };
-        if (data.recoveryDirectories) tx.recoveryDirectories = data.recoveryDirectories.map(path => {
-          const resolved = this.resolvePath(path);
-          if (!resolved.split(sep).at(-1)?.startsWith(`.shadow-vfs-${txId}-`)) throw new Error("Invalid recovery directory.");
-          return resolved;
-        });
-        this.transactions.set(txId, tx);
+      const names = readdirSync(journalDirectory).filter(name => /^[0-9a-f-]{36}\.json$/i.test(name));
+      for (const name of names) {
+        const path = join(journalDirectory, name);
+        const txId = name.slice(0, -5);
+        try {
+          z.string().uuid().parse(txId);
+          const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+          const data = this.decodeJournal(raw);
+          const tx: Transaction = { state: data.state === "VERIFIED" ? "ACTIVE" : data.state, buffers: new Map(data.files.map(file => [this.resolvePath(file.filePath), file.buffer as FileBuffer])) };
+          if (data.recoveryDirectories) tx.recoveryDirectories = data.recoveryDirectories.map(recoveryPath => {
+            const resolved = resolve(recoveryPath);
+            const local = relative(this.baseDirectory, resolved);
+            if (!local || isAbsolute(local) || local === ".." || local.startsWith(`..${sep}`) || !resolved.split(sep).at(-1)?.startsWith(`.shadow-vfs-${txId}-`)) throw new Error("Invalid recovery directory in transaction journal.");
+            return resolved;
+          });
+          this.transactions.set(txId, tx);
+          // Upgrade older unversioned records on disk and persist the fact
+          // that a prior VERIFIED result must be checked again after restart.
+          if (this.isLegacyJournal(raw) || data.state === "VERIFIED") this.persist(txId);
+        } catch (error) {
+          this.journalProblems.push({ txId, path, message: error instanceof Error ? error.message : String(error) });
+        }
       }
+      this.cleanupJournalTemporaries();
+      if (this.journalProblems.length === 0) this.cleanupOrphanedCommitDirectories(journalDirectory);
     }
   }
   begin(): string {
@@ -106,6 +133,7 @@ export class TransactionManager {
     return { txId, state: tx.state, files: [...tx.buffers].map(([filePath, buffer]) => ({ filePath, ...buffer })), recoveryDirectories: tx.recoveryDirectories ?? [] };
   }
   list() { return [...this.transactions.keys()].map(txId => ({ txId, state: this.getState(txId), fileCount: this.requireTransaction(txId).buffers.size })); }
+  journalIssues(): readonly JournalIssue[] { return this.journalProblems.map(issue => ({ ...issue })); }
   getBuffer(txId: string, filePath: string): FileBuffer | undefined {
     const buffer = this.requireTransaction(txId).buffers.get(this.resolvePath(filePath));
     return buffer === undefined ? undefined : { ...buffer };
@@ -370,12 +398,65 @@ export class TransactionManager {
     const tx = this.requireTransaction(txId);
     const target = join(this.journalDirectory, `${txId}.json`);
     const temporary = `${target}.${randomUUID()}.tmp`;
+    const payload = JSON.stringify({ version: 1, state: tx.state, files: [...tx.buffers].map(([filePath, buffer]) => ({ filePath, buffer })), recoveryDirectories: tx.recoveryDirectories });
     const fd = openSync(temporary, "wx", 0o600);
     try {
-      writeFileSync(fd, JSON.stringify({ state: tx.state, files: [...tx.buffers].map(([filePath, buffer]) => ({ filePath, buffer })), recoveryDirectories: tx.recoveryDirectories }));
+      writeFileSync(fd, JSON.stringify({ formatVersion: 1, checksum: createHash("sha256").update(payload).digest("hex"), payload }));
       fsyncSync(fd);
     } finally { closeSync(fd); }
-    renameSync(temporary, target);
+    try { renameSync(temporary, target); }
+    finally { if (existsSync(temporary)) unlinkSync(temporary); }
+  }
+  private decodeJournal(raw: unknown): z.infer<typeof journalPayloadSchema> {
+    if (typeof raw === "object" && raw !== null && "formatVersion" in raw) {
+      const envelope = journalEnvelopeSchema.parse(raw);
+      if (envelope.formatVersion !== 1) throw new Error(`Unsupported journal format version ${envelope.formatVersion}.`);
+      const actual = createHash("sha256").update(envelope.payload).digest();
+      const expected = Buffer.from(envelope.checksum, "hex");
+      if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) throw new Error("Journal checksum mismatch; record was left untouched.");
+      const payload = journalPayloadSchema.parse(JSON.parse(envelope.payload));
+      if (payload.version !== envelope.formatVersion) throw new Error("Journal envelope and payload versions do not match.");
+      return payload;
+    }
+    return legacyJournalSchema.parse(raw);
+  }
+  private isLegacyJournal(raw: unknown): boolean { return !(typeof raw === "object" && raw !== null && "formatVersion" in raw); }
+  private cleanupJournalTemporaries(): void {
+    if (!this.journalDirectory) return;
+    for (const name of readdirSync(this.journalDirectory)) {
+      if (!/^(?:[0-9a-f-]{36}\.json\.[0-9a-f-]{36}|workspace\.lock\.[0-9a-f-]{36})\.tmp$/i.test(name)) continue;
+      const path = join(this.journalDirectory, name);
+      try {
+        const metadata = lstatSync(path);
+        if (metadata.isFile() && metadata.nlink === 1) unlinkSync(path);
+        else this.journalProblems.push({ txId: "", path, message: "Temporary journal artifact is not a single-link regular file; left untouched." });
+      } catch (error) {
+        this.journalProblems.push({ txId: "", path, message: `Could not inspect temporary journal artifact: ${String(error)}` });
+      }
+    }
+  }
+  private cleanupOrphanedCommitDirectories(journalDirectory: string): void {
+    const referenced = new Set([...this.transactions.values()].flatMap(tx => tx.recoveryDirectories ?? []));
+    const pattern = /^\.shadow-vfs-[0-9a-f-]{36}-.+$/i;
+    const visit = (directory: string): void => {
+      let entries;
+      try { entries = readdirSync(directory, { withFileTypes: true }); }
+      catch { return; }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const child = join(directory, entry.name);
+        const name = process.platform === "win32" ? entry.name.toLowerCase() : entry.name;
+        if (child === journalDirectory || name === ".git" || name === "node_modules") continue;
+        if (pattern.test(entry.name)) {
+          if (referenced.has(resolve(child))) continue;
+          try { rmSync(child, { recursive: true }); }
+          catch (error) { this.journalProblems.push({ txId: "", path: child, message: `Could not remove orphaned commit directory: ${String(error)}` }); }
+          continue;
+        }
+        visit(child);
+      }
+    };
+    visit(this.baseDirectory);
   }
   private requireTransaction(txId: string): Transaction {
     const tx = this.transactions.get(txId);

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { z } from "zod";
 function payload(value: unknown): Record<string, unknown> { return z.record(z.unknown()).parse(value); }
 import { mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { acquireWorkspaceLock } from "../src/vfs/workspace-lock.js";
+import { TransactionManager } from "../src/vfs/transaction-manager.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -165,14 +167,66 @@ test("ambiguous lock metadata and abandoned guards fail closed", async t => {
   await recovered.release();
 });
 
-test("failed journal initialization releases the server workspace lock", async t => {
-  const root = await mkdtemp(join(tmpdir(), "lock-startup-"));
+test("a damaged journal is reported while valid transactions remain available", async t => {
+  const root = await mkdtemp(join(tmpdir(), "journal-damaged-"));
   t.after(() => rm(root, { recursive: true, force: true }));
-  await mkdir(join(root, ".transactional-refactor"));
-  await writeFile(join(root, ".transactional-refactor/00000000-0000-4000-8000-000000000000.json"), "broken journal");
-  const failed = spawnSync(process.execPath, [fileURLToPath(new URL("../src/index.js", import.meta.url)), "--workspace", root], { encoding: "utf8", timeout: 15_000 });
-  assert.equal(failed.status, 1, failed.stderr);
-  await assert.rejects(readFile(join(root, ".transactional-refactor/workspace.lock")), { code: "ENOENT" });
-  const lock = await acquireWorkspaceLock(root);
-  await lock.release();
+  const directory = join(root, ".transactional-refactor");
+  await mkdir(directory);
+  const brokenPath = join(directory, "00000000-0000-4000-8000-000000000000.json");
+  await writeFile(brokenPath, "broken journal");
+  const client = new Client({ name: "damaged-journal-test", version: "0.2.0" });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL("../src/index.js", import.meta.url)), "--workspace", root], stderr: "pipe" });
+  t.after(async () => { await client.close(); });
+  await client.connect(transport);
+  const listed = payload((await client.callTool({ name: "tx_list", arguments: {} })).structuredContent);
+  assert.equal((listed["transactions"] as unknown[]).length, 0);
+  assert.equal((listed["journalIssues"] as Array<Record<string, unknown>>)[0]?.["txId"], "00000000-0000-4000-8000-000000000000");
+  assert.equal(await readFile(brokenPath, "utf8"), "broken journal");
+  const begun = await client.callTool({ name: "tx_begin", arguments: {} });
+  assert.equal(typeof payload(begun.structuredContent)["txId"], "string");
+});
+
+test("legacy journals are upgraded to checksummed versioned records", async t => {
+  const root = await mkdtemp(join(tmpdir(), "journal-upgrade-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "example.ts"), "export const value = 1;\n");
+  const directory = join(root, ".transactional-refactor");
+  await mkdir(directory);
+  const txId = "00000000-0000-4000-8000-000000000001";
+  await writeFile(join(directory, `${txId}.json`), JSON.stringify({ state: "VERIFIED", files: [{ filePath: join(root, "example.ts"), buffer: { baselineContent: "export const value = 1;\n", currentContent: "export const value = 2;\n", version: 1 } }] }));
+  const manager = new TransactionManager(root, undefined, directory);
+  assert.equal(manager.getState(txId), "ACTIVE");
+  const envelope = JSON.parse(await readFile(join(directory, `${txId}.json`), "utf8"));
+  assert.equal(envelope.formatVersion, 1);
+  assert.equal(typeof envelope.checksum, "string");
+  assert.equal(JSON.parse(envelope.payload).version, 1);
+});
+
+test("a journal checksum failure preserves its record and reports a recovery issue", async t => {
+  const root = await mkdtemp(join(tmpdir(), "journal-checksum-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = join(root, ".transactional-refactor");
+  await mkdir(directory);
+  const txId = "00000000-0000-4000-8000-000000000002";
+  await writeFile(join(directory, `${txId}.json`), JSON.stringify({ formatVersion: 1, checksum: "0".repeat(64), payload: JSON.stringify({ version: 1, state: "ACTIVE", files: [] }) }));
+  const manager = new TransactionManager(root, undefined, directory);
+  assert.equal(manager.list().length, 0);
+  assert.match(manager.journalIssues()[0]!.message, /checksum/);
+  assert.equal((await readFile(join(directory, `${txId}.json`), "utf8")).includes("checksum"), true);
+  assert.ok(manager.begin());
+});
+
+test("startup cleanup removes only stale owned temporaries and orphan commit directories", async t => {
+  const f = await mkdtemp(join(tmpdir(), "journal-cleanup-")); t.after(() => rm(f, { recursive: true, force: true }));
+  const directory = join(f, ".transactional-refactor"); await mkdir(directory);
+  const staleTemp = join(directory, `00000000-0000-4000-8000-000000000003.json.00000000-0000-4000-8000-000000000004.tmp`);
+  await writeFile(staleTemp, "incomplete journal write");
+  const staleLockTemp = join(directory, "workspace.lock.00000000-0000-4000-8000-000000000005.tmp");
+  await writeFile(staleLockTemp, "incomplete lock write");
+  const orphan = join(f, ".shadow-vfs-00000000-0000-4000-8000-000000000006-abcd"); await mkdir(orphan);
+  const manager = new TransactionManager(f, undefined, directory);
+  assert.equal(manager.journalIssues().length, 0);
+  await assert.rejects(readFile(staleTemp), { code: "ENOENT" });
+  await assert.rejects(readFile(staleLockTemp), { code: "ENOENT" });
+  assert.equal(existsSync(orphan), false);
 });
