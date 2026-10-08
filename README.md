@@ -77,6 +77,33 @@ are allowed when their file, position, code, and message remain unchanged.
 
 ## Restart and recovery
 
+### Workspace ownership
+
+The MCP server acquires an exclusive workspace lock before loading journals and
+holds it until queued operations finish and the server shuts down. A second
+server for the same canonical workspace fails at startup with an ownership error.
+Different workspaces can run independently. This lock coordinates cooperating
+MCP servers on one machine; it does not lock out editors or other file writers.
+
+Ownership is recorded in `.transactional-refactor/workspace.lock`. An atomic
+`workspace.lock.guard` directory serializes acquisition, stale-owner replacement,
+and release. After a process crash, a new server reclaims ownership only if the
+recorded local PID no longer exists. A live or reused PID, uncertain process
+status, a foreign hostname, or malformed ownership data blocks startup.
+
+If a process dies while changing ownership, the short-lived guard may remain.
+Retry first; if the guard persists, stop all servers using the workspace, inspect
+the lock, and remove only `workspace.lock.guard` before restarting. For malformed
+or otherwise ambiguous ownership, inspect `workspace.lock` and remove it only
+after confirming all owners have stopped. Do not remove transaction journals.
+Shared workspaces across hosts or PID namespaces are not supported.
+
+The lower-level `TransactionManager` does not acquire this server-lifetime lock.
+Applications embedding it must hold `acquireWorkspaceLock()` themselves when
+sharing persistent journals.
+
+### Pending transactions
+
 The MCP server saves transaction records under `.transactional-refactor/` in the
 workspace. Keep this directory out of version control: it contains full original
 and staged file contents. Staging writes this metadata but does not change source
@@ -145,9 +172,8 @@ This is a v0.2 prototype, not a production durability or security boundary.
   inode identity are not guaranteed.
 - Verification runs two compiler passes and can be slow on large workspaces.
   It uses the bundled TypeScript version, not a workspace-specific compiler.
-- Run one server instance per workspace. Operations are serialized in that
-  process; the journal is not a cross-process lock. Cooperating external writers
-  must remain idle during verification and commit.
+- The workspace lock admits one cooperating MCP server per workspace on a local
+  machine. External writers must remain idle during verification and commit.
 - The raw VFS `commit()` is a lower-level primitive. The verification gate is
   enforced by the MCP `tx_commit` tool.
 

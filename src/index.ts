@@ -9,6 +9,7 @@ import { createTwoFilesPatch, diffLines } from "diff";
 import { z } from "zod/v4";
 import { CommitError, ConflictError, TransactionError, TransactionManager } from "./vfs/transaction-manager.js";
 import { VerificationPipeline } from "./verifier/verification-pipeline.js";
+import { acquireWorkspaceLock } from "./vfs/workspace-lock.js";
 
 // MCP transport alone owns stdout. Even accidental console.log goes to stderr.
 globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
@@ -86,6 +87,16 @@ async function main(): Promise<void> {
   const { values } = parseArgs({ options: { workspace: { type: "string" } }, strict: true, allowPositionals: false });
   const root = await realpath(resolve(values.workspace ?? process.env["WORKSPACE_ROOT"] ?? process.cwd()));
   if (!(await stat(root)).isDirectory()) throw new Error("Workspace root must be a directory.");
+  const lock = await acquireWorkspaceLock(root);
+  try {
+    await runServer(root, lock);
+  } catch (error) {
+    try { await lock.release(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], "Startup and lock release failed."); }
+    throw error;
+  }
+}
+async function runServer(root: string, lock: { release(): Promise<void> }): Promise<void> {
   const transactions = new TransactionManager(root, undefined, join(root, ".transactional-refactor"));
   const verifier = new VerificationPipeline(transactions, root);
   const server = new Server({ name: "transactional-refactor-mcp", version: "0.2.0" }, {
@@ -212,6 +223,7 @@ async function main(): Promise<void> {
       await queue;
       const errors: unknown[] = [];
       try { await server.close(); } catch (error) { errors.push(error); }
+      try { await lock.release(); } catch (error) { errors.push(error); }
       process.stdin.pause();
       if (errors.length) throw new AggregateError(errors, "Cleanup failed.");
     })();

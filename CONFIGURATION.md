@@ -112,9 +112,12 @@ Reference: [Codex MCP](https://developers.openai.com/codex/mcp/).
 Launch Node directly from the IDE, rather than an npm wrapper that may
 print startup banners to stdout. Diagnostic logs use stderr.
 
-The server loads persisted journals before accepting MCP connections. Keep
-`.transactional-refactor/` out of version control and run one server instance per
-workspace. Large project-wide verification operations may need a larger client
+The server locks the workspace before loading persisted journals or accepting
+MCP connections. A second server for the same workspace exits with an ownership
+error; stop the first server before reconnecting from another client. Locks from
+exited local processes are reclaimed automatically. Ambiguous locks or abandoned
+acquisition guards require inspection as described in the README.
+Keep `.transactional-refactor/` out of version control. Large project-wide verification operations may need a larger client
 tool timeout. Commit reverifies even if an earlier verify call passed.
 
 Do not edit transaction files externally while a commit is running.
